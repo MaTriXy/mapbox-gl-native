@@ -3,24 +3,28 @@
 #include <mbgl/renderer/query.hpp>
 #include <mbgl/renderer/tile_parameters.hpp>
 #include <mbgl/actor/scheduler.hpp>
-#include <mbgl/style/filter_evaluator.hpp>
 #include <mbgl/util/string.hpp>
+#include <mbgl/tile/tile_observer.hpp>
+#include <mbgl/style/custom_tile_loader.hpp>
 
 #include <mapbox/geojsonvt.hpp>
+
+#include <cassert>
+#include <utility>
 
 namespace mbgl {
 
 CustomGeometryTile::CustomGeometryTile(const OverscaledTileID& overscaledTileID,
-                         std::string sourceID_,
-                         const TileParameters& parameters,
-                         const style::CustomGeometrySource::TileOptions options_,
-                         ActorRef<style::CustomTileLoader> loader_)
-    : GeometryTile(overscaledTileID, sourceID_, parameters),
-    necessity(TileNecessity::Optional),
-    options(options_),
-    loader(loader_),
-    actor(*Scheduler::GetCurrent(), std::bind(&CustomGeometryTile::setTileData, this, std::placeholders::_1)) {
-}
+                                       std::string sourceID_,
+                                       const TileParameters& parameters,
+                                       Immutable<style::CustomGeometrySource::TileOptions> options_,
+                                       ActorRef<style::CustomTileLoader> loader_)
+    : GeometryTile(overscaledTileID, std::move(sourceID_), parameters),
+      necessity(TileNecessity::Optional),
+      options(std::move(options_)),
+      loader(std::move(loader_)),
+      mailbox(std::make_shared<Mailbox>(*Scheduler::GetCurrent())),
+      actorRef(*this, mailbox) {}
 
 CustomGeometryTile::~CustomGeometryTile() {
     loader.invoke(&style::CustomTileLoader::removeTile, id);
@@ -28,29 +32,37 @@ CustomGeometryTile::~CustomGeometryTile() {
 
 void CustomGeometryTile::setTileData(const GeoJSON& geoJSON) {
 
-    auto featureData = mapbox::geometry::feature_collection<int16_t>();
+    auto featureData = mapbox::feature::feature_collection<int16_t>();
     if (geoJSON.is<FeatureCollection>() && !geoJSON.get<FeatureCollection>().empty()) {
-        const double scale = util::EXTENT / options.tileSize;
+        auto scale = util::EXTENT / options->tileSize;
+        assert(util::EXTENT % options->tileSize == 0);
 
         mapbox::geojsonvt::TileOptions vtOptions;
         vtOptions.extent = util::EXTENT;
-        vtOptions.buffer = ::round(scale * options.buffer);
-        vtOptions.tolerance = scale * options.tolerance;
-        featureData = mapbox::geojsonvt::geoJSONToTile(geoJSON, id.canonical.z, id.canonical.x, id.canonical.y, vtOptions).features;
-    } else {
-        setNecessity(TileNecessity::Optional);
+        vtOptions.buffer = ::round(scale * options->buffer);
+        vtOptions.tolerance = scale * options->tolerance;
+        featureData =
+            mapbox::geojsonvt::geoJSONToTile(
+                geoJSON, id.canonical.z, id.canonical.x, id.canonical.y, vtOptions, options->wrap, options->clip)
+                .features;
     }
     setData(std::make_unique<GeoJSONTileData>(std::move(featureData)));
+}
+
+void CustomGeometryTile::invalidateTileData() {
+    stale = true;
+    observer->onTileChanged(*this);
 }
 
 //Fetching tile data for custom sources is assumed to be an expensive operation.
 // Only required tiles make fetchTile requests. Attempt to cancel a tile
 // that is no longer required.
 void CustomGeometryTile::setNecessity(TileNecessity newNecessity) {
-   if (newNecessity != necessity) {
+   if (newNecessity != necessity || stale ) {
         necessity = newNecessity;
         if (necessity == TileNecessity::Required) {
-            loader.invoke(&style::CustomTileLoader::fetchTile, id, actor.self());
+            loader.invoke(&style::CustomTileLoader::fetchTile, id, actorRef);
+            stale = false;
         } else if (!isRenderable()) {
             loader.invoke(&style::CustomTileLoader::cancelTile, id);
         }
@@ -68,9 +80,9 @@ void CustomGeometryTile::querySourceFeatures(
         auto featureCount = layer->featureCount();
         for (std::size_t i = 0; i < featureCount; i++) {
             auto feature = layer->getFeature(i);
-            
+
             // Apply filter, if any
-            if (queryOptions.filter && !(*queryOptions.filter)(*feature)) {
+            if (queryOptions.filter && !(*queryOptions.filter)(style::expression::EvaluationContext { static_cast<float>(id.overscaledZ), feature.get() })) {
                 continue;
             }
 

@@ -61,7 +61,7 @@ public:
     // world, unwrap the start longitude to ensure the shortest path is taken.
     void unwrapForShortestPath(const LatLng& end) {
         const double delta = std::abs(end.lon - lon);
-        if (delta < util::LONGITUDE_MAX || delta > util::DEGREES_MAX) return;
+        if (delta <= util::LONGITUDE_MAX || delta >= util::DEGREES_MAX) return;
         if (lon > 0 && end.lon < 0) lon -= util::DEGREES_MAX;
         else if (lon < 0 && end.lon > 0) lon += util::DEGREES_MAX;
     }
@@ -82,14 +82,10 @@ public:
 class LatLngBounds {
 public:
     // Return a bounds covering the entire (unwrapped) world.
-    static LatLngBounds world() {
-        return LatLngBounds({-90, -180}, {90, 180});
-    }
+    static LatLngBounds world() { return {{-90, -180}, {90, 180}}; }
 
     // Return the bounds consisting of the single point.
-    static LatLngBounds singleton(const LatLng& a) {
-        return LatLngBounds(a, a);
-    }
+    static LatLngBounds singleton(const LatLng& a) { return {a, a}; }
 
     // Return the convex hull of two points; the smallest bounds that contains both.
     static LatLngBounds hull(const LatLng& a, const LatLng& b) {
@@ -105,6 +101,13 @@ public:
         return bounds;
     }
 
+    /// Construct an infinite bound, a bound for which the constrain method returns its
+    /// input unmodified.
+    ///
+    /// Note: this is different than LatLngBounds::world() since arbitrary unwrapped
+    /// coordinates are also inside the bounds.
+    LatLngBounds() : sw({-90, -180}), ne({90, 180}), bounded(false) {}
+
     // Constructs a LatLngBounds object with the tile's exact boundaries.
     LatLngBounds(const CanonicalTileID&);
 
@@ -119,23 +122,12 @@ public:
 
     LatLng southwest() const { return sw; }
     LatLng northeast() const { return ne; }
-    LatLng southeast() const { return LatLng(south(), east()); }
-    LatLng northwest() const { return LatLng(north(), west()); }
+    LatLng southeast() const { return {south(), east()}; }
+    LatLng northwest() const { return {north(), west()}; }
 
-    LatLng center() const {
-        return LatLng((sw.latitude() + ne.latitude()) / 2,
-                      (sw.longitude() + ne.longitude()) / 2);
-    }
+    LatLng center() const { return {(sw.latitude() + ne.latitude()) / 2, (sw.longitude() + ne.longitude()) / 2}; }
 
-    LatLng constrain(const LatLng& p) const {
-        if (contains(p)) {
-            return p;
-        }
-        return LatLng {
-            util::clamp(p.latitude(), sw.latitude(), ne.latitude()),
-            util::clamp(p.longitude(), sw.longitude(), ne.longitude())
-        };
-    }
+    LatLng constrain(const LatLng& p) const;
 
     void extend(const LatLng& point) {
         sw = LatLng(std::min(point.latitude(), sw.latitude()),
@@ -154,36 +146,28 @@ public:
                sw.longitude() > ne.longitude();
     }
 
-    bool contains(const LatLng& point) const {
-        return (point.latitude()  >= sw.latitude()  &&
-                point.latitude()  <= ne.latitude()  &&
-                point.longitude() >= sw.longitude() &&
-                point.longitude() <= ne.longitude());
+    bool crossesAntimeridian() const {
+        return (sw.wrapped().longitude() > ne.wrapped().longitude());
     }
 
-    bool contains(const LatLngBounds& area) const {
-        return (area.ne.latitude()  <= ne.latitude()  &&
-                area.sw.latitude()  >= sw.latitude()  &&
-                area.ne.longitude() <= ne.longitude() &&
-                area.sw.longitude() >= sw.longitude());
-    }
+    bool contains(const CanonicalTileID& tileID) const;
+    bool contains(const LatLng& point, LatLng::WrapMode wrap = LatLng::Unwrapped) const;
+    bool contains(const LatLngBounds& area, LatLng::WrapMode wrap = LatLng::Unwrapped) const;
 
-    bool intersects(const LatLngBounds area) const {
-        return (area.ne.latitude()  > sw.latitude()  &&
-                area.sw.latitude()  < ne.latitude()  &&
-                area.ne.longitude() > sw.longitude() &&
-                area.sw.longitude() < ne.longitude());
-    }
+    bool intersects(LatLngBounds area, LatLng::WrapMode wrap = LatLng::Unwrapped) const;
 
 private:
     LatLng sw;
     LatLng ne;
+    bool bounded = true;
 
-    LatLngBounds(LatLng sw_, LatLng ne_)
-        : sw(std::move(sw_)), ne(std::move(ne_)) {}
+    LatLngBounds(LatLng sw_, LatLng ne_) : sw(sw_), ne(ne_) {}
+
+    bool containsLatitude(double latitude) const;
+    bool containsLongitude(double longitude, LatLng::WrapMode wrap) const;
 
     friend bool operator==(const LatLngBounds& a, const LatLngBounds& b) {
-        return a.sw == b.sw && a.ne == b.ne;
+        return (!a.bounded && !b.bounded) || (a.bounded && b.bounded && a.sw == b.sw && a.ne == b.ne);
     }
 
     friend bool operator!=(const LatLngBounds& a, const LatLngBounds& b) {
@@ -255,6 +239,11 @@ public:
     friend bool operator!=(const EdgeInsets& a, const EdgeInsets& b) {
         return !(a == b);
     }
+};
+
+struct LatLngAltitude {
+    LatLng location = {0.0, 0.0};
+    double altitude = 0.0;
 };
 
 } // namespace mbgl
